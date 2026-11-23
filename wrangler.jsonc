@@ -1,0 +1,21 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "plurmurate-ecologistics",
+  "main": "./workers/app.ts",
+  "compatibility_date": "2026-11-23",
+  "observability": { "enabled": true },
+  "upload_source_maps": true,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "plurmurate-ecologistics",
+      "database_id": "PASTE_THE_ID_FROM_STEP_1"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MEDIA",
+      "bucket_name": "YOUR_BUCKET_NAME"
+    }
+  ]
+}
