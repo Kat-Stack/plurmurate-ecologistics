@@ -12,6 +12,10 @@
       "database_id": "68a74ab5-2d57-4d31-a775-b4cecaad4c21"
     }
   ],
+"vars": {
+    "X_HOST_HANDLE": "SistersOfVera",
+    "X_HOST_USER_ID": "2055384827382145024"
+  },
   "r2_buckets": [
     {
       "binding": "MEDIA",
