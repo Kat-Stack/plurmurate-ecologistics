@@ -8,14 +8,14 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "plurmurate-ecologistics",
+      "database_name": "plurmurate",
       "database_id": "68a74ab5-2d57-4d31-a775-b4cecaad4c21"
     }
   ],
   "r2_buckets": [
     {
       "binding": "MEDIA",
-      "bucket_name": "YOUR_BUCKET_NAME"
+      "bucket_name": "plurmur"
     }
   ]
 }
