@@ -1,4 +1,10 @@
-import { Form, useActionData, useLoaderData, type ActionFunctionArgs, type LoaderFunctionArgs } from "react-router";
+import {
+  Form,
+  useActionData,
+  useLoaderData,
+  type ActionFunctionArgs,
+  type LoaderFunctionArgs,
+} from "react-router";
 import {
   fetchGuildRoles,
   syncMemberTierInDb,
@@ -6,6 +12,13 @@ import {
   type TierDefinitionRow,
 } from "../lib/discord-tiers.server";
 import { getActiveCommunityId } from "../lib/gating.server";
+import {
+  addTierDefinition,
+  buildStarterTierDrafts,
+  deleteTierDefinition,
+  seedTiersIfEmpty,
+  updateTierDefinition,
+} from "../lib/tier-builder.server";
 
 interface CommunityConfigRow {
   id: string;
@@ -16,16 +29,21 @@ interface CommunityConfigRow {
   disable_follower_gate: number;
 }
 
-export async function loader({ request, context }: LoaderFunctionArgs) {
-  const env = context.cloudflare.env as {
-    DB: D1Database;
-    DISCORD_BOT_TOKEN?: string;
-  };
+interface WorkerEnv {
+  DB: D1Database;
+  DISCORD_BOT_TOKEN?: string;
+}
 
+function getEnv(context: LoaderFunctionArgs["context"]): WorkerEnv {
+  const ctx = context as { cloudflare?: { env?: WorkerEnv }; env?: WorkerEnv };
+  return (ctx.cloudflare?.env ?? ctx.env ?? {}) as WorkerEnv;
+}
+
+export async function loader({ request, context }: LoaderFunctionArgs) {
+  const env = getEnv(context);
   const url = new URL(request.url);
-  const requestedCommunityId = url.searchParams.get("communityId") || undefined;
   const communityId =
-    requestedCommunityId || (await getActiveCommunityId(env.DB));
+    url.searchParams.get("communityId") || (await getActiveCommunityId(env.DB));
 
   if (!communityId) {
     return {
@@ -88,20 +106,11 @@ export async function loader({ request, context }: LoaderFunctionArgs) {
   };
 }
 
-export async function action({ request, context }: ActionFunctionArgs) {
-  const env = context.cloudflare.env as {
-    DB: D1Database;
-    DISCORD_BOT_TOKEN?: string;
-  };
-
-  const formData = await request.formData();
-  const intent = String(formData.get("intent") || "save");
-  const communityId = String(formData.get("communityId") || "").trim();
-
-  if (!communityId) {
-    return { ok: false, message: "Missing communityId." };
-  }
-
+async function saveAllTiersFromForm(
+  db: D1Database,
+  communityId: string,
+  formData: FormData
+) {
   const guildId = String(formData.get("guild_id") || "").trim();
   const notificationChannelId =
     String(formData.get("notification_channel_id") || "").trim() || null;
@@ -109,7 +118,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
     String(formData.get("fallback_tier_id") || "").trim() || null;
   const disableFollowerGate = formData.get("disable_follower_gate") === "on" ? 1 : 0;
 
-  await env.DB
+  await db
     .prepare(
       `UPDATE community_discord_configs
        SET guild_id = ?1,
@@ -132,46 +141,86 @@ export async function action({ request, context }: ActionFunctionArgs) {
   const tierIds = formData.getAll("tier_id").map(String);
   for (const tierId of tierIds) {
     const label = String(formData.get(`label_${tierId}`) || "").trim();
+    const slug = String(formData.get(`slug_${tierId}`) || "").trim();
     const rankOrder = Number(formData.get(`rank_order_${tierId}`) ?? 0);
     const voteWeight = Number(formData.get(`vote_weight_${tierId}`) ?? 0);
-    const canNominate = formData.get(`can_nominate_${tierId}`) === "on" ? 1 : 0;
-    const canVote = formData.get(`can_vote_${tierId}`) === "on" ? 1 : 0;
-    const canApprove = formData.get(`can_approve_${tierId}`) === "on" ? 1 : 0;
+    const canNominate = formData.get(`can_nominate_${tierId}`) === "on";
+    const canVote = formData.get(`can_vote_${tierId}`) === "on";
+    const canApprove = formData.get(`can_approve_${tierId}`) === "on";
 
-    // Supports both multi-select checkboxes and comma-separated role IDs
     const checkedRoles = formData.getAll(`roles_${tierId}`).map(String);
     const rawRoleIds = String(formData.get(`role_ids_raw_${tierId}`) || "");
     const extraRoles = rawRoleIds
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
-    const mergedRoleIds = Array.from(new Set([...checkedRoles, ...extraRoles]));
 
-    await env.DB
-      .prepare(
-        `UPDATE discord_tier_definitions
-         SET label = ?1,
-             rank_order = ?2,
-             discord_role_ids_json = ?3,
-             vote_weight = ?4,
-             can_nominate = ?5,
-             can_vote = ?6,
-             can_approve = ?7
-         WHERE id = ?8 AND community_id = ?9`
-      )
-      .bind(
-        label || tierId,
-        Number.isFinite(rankOrder) ? rankOrder : 0,
-        JSON.stringify(mergedRoleIds),
-        Number.isFinite(voteWeight) ? voteWeight : 0,
-        canNominate,
-        canVote,
-        canApprove,
-        tierId,
-        communityId
-      )
-      .run();
+    await updateTierDefinition(db, communityId, tierId, {
+      label: label || tierId,
+      slug: slug || label || tierId,
+      rankOrder,
+      roleIds: [...checkedRoles, ...extraRoles],
+      voteWeight,
+      canNominate,
+      canVote,
+      canApprove,
+    });
   }
+}
+
+export async function action({ request, context }: ActionFunctionArgs) {
+  const env = getEnv(context);
+  const formData = await request.formData();
+  const intent = String(formData.get("intent") || "save");
+  const communityId = String(formData.get("communityId") || "").trim();
+
+  if (!communityId) {
+    return { ok: false, message: "Missing communityId." };
+  }
+
+  if (intent === "add_tier") {
+    const newLabel = String(formData.get("new_tier_label") || "").trim();
+    const newSlug = String(formData.get("new_tier_slug") || newLabel).trim();
+    const newRankOrder = Number(formData.get("new_tier_rank") ?? 10);
+    const newWeight = Number(formData.get("new_tier_weight") ?? 1);
+
+    if (!newLabel) {
+      return { ok: false, message: "Enter a tier name before adding." };
+    }
+
+    await addTierDefinition(env.DB, communityId, {
+      label: newLabel,
+      slug: newSlug,
+      rankOrder,
+      roleIds: [],
+      voteWeight: newWeight,
+      canNominate: formData.get("new_tier_nominate") === "on",
+      canVote: formData.get("new_tier_vote") === "on",
+      canApprove: formData.get("new_tier_approve") === "on",
+    });
+
+    return { ok: true, message: `Added tier "${newLabel}".` };
+  }
+
+  if (intent === "delete_tier") {
+    const deleteTierId = String(formData.get("delete_tier_id") || "").trim();
+    if (deleteTierId) {
+      await deleteTierDefinition(env.DB, communityId, deleteTierId);
+    }
+    return { ok: true, message: "Removed tier." };
+  }
+
+  if (intent === "generate_n_tiers") {
+    const requestedCount = Number(formData.get("starter_tier_count") ?? 1);
+    const drafts = buildStarterTierDrafts({ count: requestedCount });
+    await seedTiersIfEmpty(env.DB, communityId, drafts);
+    return {
+      ok: true,
+      message: `Initialized ${drafts.length} starter tier(s) for this community.`,
+    };
+  }
+
+  await saveAllTiersFromForm(env.DB, communityId, formData);
 
   if (intent === "sync_members" && env.DISCORD_BOT_TOKEN) {
     const membersRes = await env.DB
@@ -201,11 +250,11 @@ export async function action({ request, context }: ActionFunctionArgs) {
 
     return {
       ok: true,
-      message: `Saved tier rules and re-synced ${syncedCount} linked Discord member(s).`,
+      message: `Saved ${formData.getAll("tier_id").length} tier(s) and re-synced ${syncedCount} member(s).`,
     };
   }
 
-  return { ok: true, message: "Saved Discord tier rules and vote weights." };
+  return { ok: true, message: "Saved tier configuration." };
 }
 
 export default function SettingsTiersPage() {
@@ -229,7 +278,7 @@ export default function SettingsTiersPage() {
       <div>
         <h1 className="text-2xl font-bold">Discord Tiers &amp; Vote Weights</h1>
         <p className="text-sm text-neutral-600">
-          Configure role precedence, vote multipliers, and gates per server without hardcoding tier names.
+          Any number of tiers (1, 4, 10+) per server. Higher rank order wins when a member holds multiple roles.
         </p>
       </div>
 
@@ -249,6 +298,31 @@ export default function SettingsTiersPage() {
         <div className="rounded border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
           Role sync note: {roleFetchError}
         </div>
+      )}
+
+      {tiers.length === 0 && (
+        <Form method="post" className="flex flex-wrap items-end gap-3 rounded-lg border p-4">
+          <input type="hidden" name="communityId" value={community.id} />
+          <label className="block text-sm font-medium">
+            Number of starter tiers to generate
+            <input
+              type="number"
+              name="starter_tier_count"
+              min={1}
+              max={50}
+              defaultValue={1}
+              className="mt-1 w-28 rounded border px-3 py-1.5 text-sm"
+            />
+          </label>
+          <button
+            type="submit"
+            name="intent"
+            value="generate_n_tiers"
+            className="rounded bg-black px-4 py-2 text-sm font-medium text-white"
+          >
+            Generate Starter Tiers
+          </button>
+        </Form>
       )}
 
       <Form method="post" className="space-y-6">
@@ -312,7 +386,7 @@ export default function SettingsTiersPage() {
 
         <section className="space-y-4">
           <h2 className="text-lg font-semibold">
-            Tier Matrix (Highest Rank Wins on Multi-Role Members)
+            Active Tiers ({tiers.length})
           </h2>
 
           {tiers.map((tier) => {
@@ -332,9 +406,9 @@ export default function SettingsTiersPage() {
               <div key={tier.id} className="space-y-3 rounded-lg border p-4">
                 <input type="hidden" name="tier_id" value={tier.id} />
 
-                <div className="grid gap-3 sm:grid-cols-3">
+                <div className="grid gap-3 sm:grid-cols-4">
                   <label className="block text-sm font-medium">
-                    Tier Label ({tier.slug})
+                    Tier Label
                     <input
                       type="text"
                       name={`label_${tier.id}`}
@@ -344,7 +418,17 @@ export default function SettingsTiersPage() {
                   </label>
 
                   <label className="block text-sm font-medium">
-                    Precedence Rank (Higher = First)
+                    Slug
+                    <input
+                      type="text"
+                      name={`slug_${tier.id}`}
+                      defaultValue={tier.slug}
+                      className="mt-1 w-full rounded border px-3 py-1.5 text-sm"
+                    />
+                  </label>
+
+                  <label className="block text-sm font-medium">
+                    Precedence Rank
                     <input
                       type="number"
                       name={`rank_order_${tier.id}`}
@@ -354,7 +438,7 @@ export default function SettingsTiersPage() {
                   </label>
 
                   <label className="block text-sm font-medium">
-                    Vote Weight Multiplier
+                    Vote Weight
                     <input
                       type="number"
                       step="0.25"
@@ -365,31 +449,50 @@ export default function SettingsTiersPage() {
                   </label>
                 </div>
 
-                <div className="flex flex-wrap gap-6 pt-1 text-sm">
-                  <label className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      name={`can_nominate_${tier.id}`}
-                      defaultChecked={Boolean(tier.can_nominate)}
-                    />
-                    Can Nominate
-                  </label>
-                  <label className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      name={`can_vote_${tier.id}`}
-                      defaultChecked={Boolean(tier.can_vote)}
-                    />
-                    Can Vote
-                  </label>
-                  <label className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      name={`can_approve_${tier.id}`}
-                      defaultChecked={Boolean(tier.can_approve)}
-                    />
-                    Can Approve / Publish
-                  </label>
+                <div className="flex flex-wrap items-center justify-between gap-4 pt-1 text-sm">
+                  <div className="flex flex-wrap gap-6">
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        name={`can_nominate_${tier.id}`}
+                        defaultChecked={Boolean(tier.can_nominate)}
+                      />
+                      Can Nominate
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        name={`can_vote_${tier.id}`}
+                        defaultChecked={Boolean(tier.can_vote)}
+                      />
+                      Can Vote
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        name={`can_approve_${tier.id}`}
+                        defaultChecked={Boolean(tier.can_approve)}
+                      />
+                      Can Approve / Publish
+                    </label>
+                  </div>
+
+                  <button
+                    type="submit"
+                    name="intent"
+                    value="delete_tier"
+                    formNoValidate
+                    onClick={(e) => {
+                      const hidden = e.currentTarget.parentElement?.querySelector(
+                        'input[name="delete_tier_id"]'
+                      ) as HTMLInputElement | null;
+                      if (hidden) hidden.value = tier.id;
+                    }}
+                    className="rounded border border-red-300 px-2.5 py-1 text-xs text-red-700"
+                  >
+                    Delete Tier
+                  </button>
+                  <input type="hidden" name="delete_tier_id" value="" />
                 </div>
 
                 {guildRoles.length > 0 && (
@@ -438,7 +541,7 @@ export default function SettingsTiersPage() {
             value="save"
             className="rounded bg-black px-4 py-2 text-sm font-medium text-white"
           >
-            Save Tier Rules
+            Save All Tiers
           </button>
 
           <button
@@ -448,6 +551,65 @@ export default function SettingsTiersPage() {
             className="rounded border px-4 py-2 text-sm font-medium"
           >
             Save &amp; Re-Sync {linkedMemberCount} Linked Member(s)
+          </button>
+        </div>
+      </Form>
+
+      <Form method="post" className="space-y-3 rounded-lg border p-4">
+        <input type="hidden" name="communityId" value={community.id} />
+        <h2 className="text-base font-semibold">Add a New Tier</h2>
+        <div className="grid gap-3 sm:grid-cols-4">
+          <input
+            type="text"
+            name="new_tier_label"
+            placeholder="Tier name (e.g. Council)"
+            className="rounded border px-3 py-1.5 text-sm"
+            required
+          />
+          <input
+            type="text"
+            name="new_tier_slug"
+            placeholder="Slug (optional)"
+            className="rounded border px-3 py-1.5 text-sm"
+          />
+          <input
+            type="number"
+            name="new_tier_rank"
+            defaultValue={25}
+            placeholder="Rank order"
+            className="rounded border px-3 py-1.5 text-sm"
+          />
+          <input
+            type="number"
+            step="0.25"
+            name="new_tier_weight"
+            defaultValue={1}
+            placeholder="Vote weight"
+            className="rounded border px-3 py-1.5 text-sm"
+          />
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex flex-wrap gap-5 text-sm">
+            <label className="flex items-center gap-2">
+              <input type="checkbox" name="new_tier_nominate" defaultChecked />
+              Can Nominate
+            </label>
+            <label className="flex items-center gap-2">
+              <input type="checkbox" name="new_tier_vote" defaultChecked />
+              Can Vote
+            </label>
+            <label className="flex items-center gap-2">
+              <input type="checkbox" name="new_tier_approve" />
+              Can Approve
+            </label>
+          </div>
+          <button
+            type="submit"
+            name="intent"
+            value="add_tier"
+            className="rounded border bg-neutral-100 px-3.5 py-1.5 text-sm font-medium"
+          >
+            + Add Tier
           </button>
         </div>
       </Form>
