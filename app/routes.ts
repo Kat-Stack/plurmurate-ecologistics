@@ -14,4 +14,7 @@ export default [
   route("settings/publishing", "routes/settings.publishing.tsx"),
   route("settings/criteria", "routes/settings.criteria.tsx"),
   route("media/*", "routes/media.$.tsx"),
+  route("auth/discord/start", "routes/auth.discord.start.ts"),
+  route("auth/discord/callback", "routes/auth.discord.callback.ts"),
+  route("settings/tiers", "routes/settings.tiers.tsx")
 ] satisfies RouteConfig;
